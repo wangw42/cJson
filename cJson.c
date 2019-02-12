@@ -95,8 +95,46 @@ static int w_parse_number(w_context* c, w_value* v){
 
 }
 
-static int w_parse_string(w_context* c, w_value* v) {
-    size_t head = c->top, len;
+static const char* w_parse_hex4(const char* p, unsigned* u) {
+    int i;
+    *u = 0;
+    for (i = 0; i < 4; i++) {
+        char ch = *p++;
+        *u <<= 4;
+        if      (ch >= '0' && ch <= '9')  *u |= ch - '0';
+        else if (ch >= 'A' && ch <= 'F')  *u |= ch - ('A' - 10);
+        else if (ch >= 'a' && ch <= 'f')  *u |= ch - ('a' - 10);
+        else return NULL;
+    }
+    return p;
+}
+
+static void w_encode_utf8(w_context* c, unsigned u) {
+    if (u <= 0x7F) 
+        PUTC(c, u & 0xFF);
+    else if (u <= 0x7FF) {
+        PUTC(c, 0xC0 | ((u >> 6) & 0xFF));
+        PUTC(c, 0x80 | ( u       & 0x3F));
+    }
+    else if (u <= 0xFFFF) {
+        PUTC(c, 0xE0 | ((u >> 12) & 0xFF));
+        PUTC(c, 0x80 | ((u >>  6) & 0x3F));
+        PUTC(c, 0x80 | ( u        & 0x3F));
+    }
+    else {
+        assert(u <= 0x10FFFF);
+        PUTC(c, 0xF0 | ((u >> 18) & 0xFF));
+        PUTC(c, 0x80 | ((u >> 12) & 0x3F));
+        PUTC(c, 0x80 | ((u >>  6) & 0x3F));
+        PUTC(c, 0x80 | ( u        & 0x3F));
+    }
+}
+
+#define STRING_ERROR(ret) do { c->top = head; return ret; } while(0)
+
+static int w_parse_string_raw(w_context* c, char** str, size_t* len) {
+    size_t head = c->top;
+    unsigned u, u2;
     const char* p;
     EXPECT(c, '\"');
     p = c->json;
@@ -104,8 +142,8 @@ static int w_parse_string(w_context* c, w_value* v) {
         char ch = *p++;
         switch (ch) {
             case '\"':
-                len = c->top - head;
-                w_set_string(v, (const char*)w_context_pop(c, len), len);
+                *len = c->top - head;
+                *str = w_context_pop(c, *len);
                 c->json = p;
                 return W_PARSE_OK;
             case '\\':
@@ -118,22 +156,43 @@ static int w_parse_string(w_context* c, w_value* v) {
                     case 'n':  PUTC(c, '\n'); break;
                     case 'r':  PUTC(c, '\r'); break;
                     case 't':  PUTC(c, '\t'); break;
+                    case 'u':
+                        if (!(p = w_parse_hex4(p, &u)))
+                            STRING_ERROR(W_PARSE_INVALID_UNICODE_HEX);
+                        if (u >= 0xD800 && u <= 0xDBFF) { /* surrogate pair */
+                            if (*p++ != '\\')
+                                STRING_ERROR(W_PARSE_INVALID_UNICODE_SURROGATE);
+                            if (*p++ != 'u')
+                                STRING_ERROR(W_PARSE_INVALID_UNICODE_SURROGATE);
+                            if (!(p = w_parse_hex4(p, &u2)))
+                                STRING_ERROR(W_PARSE_INVALID_UNICODE_HEX);
+                            if (u2 < 0xDC00 || u2 > 0xDFFF)
+                                STRING_ERROR(W_PARSE_INVALID_UNICODE_SURROGATE);
+                            u = (((u - 0xD800) << 10) | (u2 - 0xDC00)) + 0x10000;
+                        }
+                        w_encode_utf8(c, u);
+                        break;
                     default:
-                        c->top = head;
-                        return W_PARSE_INVALID_STRING_ESCAPE;
+                        STRING_ERROR(W_PARSE_INVALID_STRING_ESCAPE);
                 }
                 break;
             case '\0':
-                c->top = head;
-                return W_PARSE_MISS_QUOTATION_MARK;
+                STRING_ERROR(W_PARSE_MISS_QUOTATION_MARK);
             default:
-                if ((unsigned char)ch < 0x20) { 
-                    c->top = head;
-                    return W_PARSE_INVALID_STRING_CHAR;
-                }
+                if ((unsigned char)ch < 0x20)
+                    STRING_ERROR(W_PARSE_INVALID_STRING_CHAR);
                 PUTC(c, ch);
         }
     }
+}
+
+static int w_parse_string(w_context* c, w_value* v) {
+    int ret;
+    char* s;
+    size_t len;
+    if ((ret = w_parse_string_raw(c, &s, &len)) == W_PARSE_OK)
+        w_set_string(v, s, len);
+    return ret;
 }
 
 static int w_parse_value(w_context* c, w_value* v) {
@@ -142,8 +201,125 @@ static int w_parse_value(w_context* c, w_value* v) {
         case 'f':  return w_parse_literal(c, v, "false", W_FALSE);
         case 'n':  return w_parse_literal(c, v, "null", W_NULL);
         default:   return w_parse_number(c, v);
+        case '"':  return w_parse_string(c, v);
+        case '[':  return w_parse_array(c, v);
+        case '{':  return w_parse_object(c, v);
         case '\0': return W_PARSE_EXPECT_VALUE;
     }
+}
+
+static int w_parse_array(w_context* c, w_value* v) {
+    size_t i, size = 0;
+    int ret;
+    EXPECT(c, '[');
+    w_parse_whitespace(c);
+    if (*c->json == ']') {
+        c->json++;
+        v->type = W_ARRAY;
+        v->u.a.size = 0;
+        v->u.a.e = NULL;
+        return W_PARSE_OK;
+    }
+    for (;;) {
+        w_value e;
+        w_init(&e);
+        if ((ret = w_parse_value(c, &e)) != W_PARSE_OK)
+            break;
+        memcpy(w_context_push(c, sizeof(w_value)), &e, sizeof(w_value));
+        size++;
+        w_parse_whitespace(c);
+        if (*c->json == ',') {
+            c->json++;
+            w_parse_whitespace(c);
+        }
+        else if (*c->json == ']') {
+            c->json++;
+            v->type = W_ARRAY;
+            v->u.a.size = size;
+            size *= sizeof(w_value);
+            memcpy(v->u.a.e = (w_value*)malloc(size), w_context_pop(c, size), size);
+            return W_PARSE_OK;
+        }
+        else {
+            ret = W_PARSE_MISS_COMMA_OR_SQUARE_BRACKET;
+            break;
+        }
+    }
+    /* Pop and free values on the stack */
+    for (i = 0; i < size; i++)
+        w_free((w_value*)w_context_pop(c, sizeof(w_value)));
+    return ret;
+}
+
+static int w_parse_object(w_context* c, w_value* v) {
+    size_t i, size;
+    w_member m;
+    int ret;
+    EXPECT(c, '{');
+    w_parse_whitespace(c);
+    if (*c->json == '}') {
+        c->json++;
+        v->type = W_OBJECT;
+        v->u.o.m = 0;
+        v->u.o.size = 0;
+        return W_PARSE_OK;
+    }
+    m.k = NULL;
+    size = 0;
+    for (;;) {
+        char* str;
+        w_init(&m.v);
+        /* parse key */
+        if (*c->json != '"') {
+            ret = W_PARSE_MISS_KEY;
+            break;
+        }
+        if ((ret = w_parse_string_raw(c, &str, &m.klen)) != W_PARSE_OK)
+            break;
+        memcpy(m.k = (char*)malloc(m.klen + 1), str, m.klen);
+        m.k[m.klen] = '\0';
+        /* parse ws colon ws */
+        w_parse_whitespace(c);
+        if (*c->json != ':') {
+            ret = W_PARSE_MISS_COLON;
+            break;
+        }
+        c->json++;
+        w_parse_whitespace(c);
+        /* parse value */
+        if ((ret = w_parse_value(c, &m.v)) != W_PARSE_OK)
+            break;
+        memcpy(w_context_push(c, sizeof(w_member)), &m, sizeof(w_member));
+        size++;
+        m.k = NULL; /* ownership is transferred to member on stack */
+        /* parse ws [comma | right-curly-brace] ws */
+        w_parse_whitespace(c);
+        if (*c->json == ',') {
+            c->json++;
+            w_parse_whitespace(c);
+        }
+        else if (*c->json == '}') {
+            size_t s = sizeof(w_member) * size;
+            c->json++;
+            v->type = W_OBJECT;
+            v->u.o.size = size;
+            memcpy(v->u.o.m = (w_member*)malloc(s), w_context_pop(c, s), s);
+            return W_PARSE_OK;
+        }
+        else {
+            ret = W_PARSE_MISS_COMMA_OR_CURLY_BRACKET;
+            break;
+        }
+    }
+    /* Pop and free members on the stack */
+    free(m.k);
+    for (i = 0; i < size; i++) {
+        w_member* m = (w_member*)w_context_pop(c, sizeof(w_member));
+        free(m->k);
+        w_free(&m->v);
+    }
+    v->type = W_NULL;
+    return ret;
 }
 
 int w_parse(w_value* v, const char* json) {
@@ -151,7 +327,9 @@ int w_parse(w_value* v, const char* json) {
     int ret;
     assert(v != NULL);
     c.json = json;
-    v->type = W_NULL;
+    c.stack = NULL;
+    c.size = c.top = 0;
+    w_init(v);
     w_parse_whitespace(&c);
     if ((ret = w_parse_value(&c, v)) == W_PARSE_OK) {
         w_parse_whitespace(&c);
@@ -160,13 +338,32 @@ int w_parse(w_value* v, const char* json) {
             ret = W_PARSE_ROOT_NOT_SINGULAR;
         }
     }
+    assert(c.top == 0);
+    free(c.stack);
     return ret;
 }
 
 void w_free(w_value* v) {
+    size_t i;
     assert(v != NULL);
-    if (v->type == W_STRING)
-        free(v->u.s.s);
+    switch (v->type) {
+        case W_STRING:
+            free(v->u.s.s);
+            break;
+        case W_ARRAY:
+            for (i = 0; i < v->u.a.size; i++)
+                w_free(&v->u.a.e[i]);
+            free(v->u.a.e);
+            break;
+        case W_OBJECT:
+            for (i = 0; i < v->u.o.size; i++) {
+                free(v->u.o.m[i].k);
+                w_free(&v->u.o.m[i].v);
+            }
+            free(v->u.o.m);
+            break;
+        default: break;
+    }
     v->type = W_NULL;
 }
 
@@ -216,3 +413,36 @@ void w_set_string(w_value* v, const char* s, size_t len) {
     v->type = W_STRING;
 }
 
+size_t w_get_array_size(const w_value* v) {
+    assert(v != NULL && v->type == W_ARRAY);
+    return v->u.a.size;
+}
+
+w_value* w_get_array_element(const w_value* v, size_t index) {
+    assert(v != NULL && v->type == W_ARRAY);
+    assert(index < v->u.a.size);
+    return &v->u.a.e[index];
+}
+
+size_t w_get_object_size(const w_value* v) {
+    assert(v != NULL && v->type == W_OBJECT);
+    return v->u.o.size;
+}
+
+const char* w_get_object_key(const w_value* v, size_t index) {
+    assert(v != NULL && v->type == W_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].k;
+}
+
+size_t w_get_object_key_length(const w_value* v, size_t index) {
+    assert(v != NULL && v->type == W_OBJECT);
+    assert(index < v->u.o.size);
+    return v->u.o.m[index].klen;
+}
+
+w_value* w_get_object_value(const w_value* v, size_t index) {
+    assert(v != NULL && v->type == W_OBJECT);
+    assert(index < v->u.o.size);
+    return &v->u.o.m[index].v;
+}
