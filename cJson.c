@@ -53,6 +53,7 @@ static void w_parse_space(w_context *c){
 	c->json = p;
 }
 
+//true false null 
 static int w_parse_literal(w_context* c, w_value* v, const char* literal, w_type type){
 	size_t i;
 	EXPECT(c, literal[0]);
@@ -71,7 +72,7 @@ static int w_parse_number(w_context* c, w_value* v){
 	if(*p == '-') p++;
 	if(*p == '0') p++;
 	else{
-		if(!ISDIGIT1TO9(*p)) return W_PARSE_INVALID_VALUE;
+		if(!ISDIGIT1TO9(*p)) return W_PARSE_INVALID_VALUE; 
 		for(p++; ISDIGIT(*p); p++);
 	}
 	if(*p == '.'){
@@ -86,8 +87,8 @@ static int w_parse_number(w_context* c, w_value* v){
         for (p++; ISDIGIT(*p); p++);
     }
     errno = 0;
-    v->n = strtod(c->json, NULL);
-    if (errno == ERANGE && (v->n == HUGE_VAL || v->n == -HUGE_VAL))
+    v->u.n = strtod(c->json, NULL); // char* to double
+    if (errno == ERANGE && (v->u.n == HUGE_VAL || v->u.n == -HUGE_VAL)) //errno.h and math.h
         return W_PARSE_NUMBER_TOO_BIG;
     v->type = W_NUMBER;
     c->json = p;
@@ -95,6 +96,7 @@ static int w_parse_number(w_context* c, w_value* v){
 
 }
 
+//解析 4 位十六进数字
 static const char* w_parse_hex4(const char* p, unsigned* u) {
     int i;
     *u = 0;
@@ -109,6 +111,16 @@ static const char* w_parse_hex4(const char* p, unsigned* u) {
     return p;
 }
 
+//utf-8
+/* eg.
+欧元符号 € → U+20AC：
+* U+20AC 在 U+0800 ~ U+FFFF 的范围内，应编码成 3 个字节。
+* U+20AC 的二进位为 10000010101100
+* 3 个字节的情况我们要 16 位的码点，所以在前面补两个 0，成为 0010000010101100
+* 按上表把二进位分成 3 组：0010, 000010, 101100
+* 加上每个字节的前缀：11100010, 10000010, 10101100
+* 用十六进位表示即：0xE2, 0x82, 0xAC
+*/
 static void w_encode_utf8(w_context* c, unsigned u) {
     if (u <= 0x7F) 
         PUTC(c, u & 0xFF);
@@ -117,9 +129,9 @@ static void w_encode_utf8(w_context* c, unsigned u) {
         PUTC(c, 0x80 | ( u       & 0x3F));
     }
     else if (u <= 0xFFFF) {
-        PUTC(c, 0xE0 | ((u >> 12) & 0xFF));
-        PUTC(c, 0x80 | ((u >>  6) & 0x3F));
-        PUTC(c, 0x80 | ( u        & 0x3F));
+        PUTC(c, 0xE0 | ((u >> 12) & 0xFF)); // 0xE0 = 11100000 
+        PUTC(c, 0x80 | ((u >>  6) & 0x3F)); // 0x80 = 10000000
+        PUTC(c, 0x80 | ( u        & 0x3F)); // 0x3F = 00111111
     }
     else {
         assert(u <= 0x10FFFF);
@@ -143,7 +155,7 @@ static int w_parse_string_raw(w_context* c, char** str, size_t* len) {
         switch (ch) {
             case '\"':
                 *len = c->top - head;
-                *str = w_context_pop(c, *len);
+                *str = (char*)w_context_pop(c, *len);
                 c->json = p;
                 return W_PARSE_OK;
             case '\\':
@@ -195,6 +207,9 @@ static int w_parse_string(w_context* c, w_value* v) {
     return ret;
 }
 
+static int w_parse_array(w_context* c, w_value* v);
+static int w_parse_object(w_context* c, w_value* v); 
+
 static int w_parse_value(w_context* c, w_value* v) {
     switch (*c->json) {
         case 't':  return w_parse_literal(c, v, "true", W_TRUE);
@@ -212,7 +227,7 @@ static int w_parse_array(w_context* c, w_value* v) {
     size_t i, size = 0;
     int ret;
     EXPECT(c, '[');
-    w_parse_whitespace(c);
+    w_parse_space(c);
     if (*c->json == ']') {
         c->json++;
         v->type = W_ARRAY;
@@ -227,10 +242,10 @@ static int w_parse_array(w_context* c, w_value* v) {
             break;
         memcpy(w_context_push(c, sizeof(w_value)), &e, sizeof(w_value));
         size++;
-        w_parse_whitespace(c);
+        w_parse_space(c);
         if (*c->json == ',') {
             c->json++;
-            w_parse_whitespace(c);
+            w_parse_space(c);
         }
         else if (*c->json == ']') {
             c->json++;
@@ -256,7 +271,7 @@ static int w_parse_object(w_context* c, w_value* v) {
     w_member m;
     int ret;
     EXPECT(c, '{');
-    w_parse_whitespace(c);
+    w_parse_space(c);
     if (*c->json == '}') {
         c->json++;
         v->type = W_OBJECT;
@@ -279,13 +294,13 @@ static int w_parse_object(w_context* c, w_value* v) {
         memcpy(m.k = (char*)malloc(m.klen + 1), str, m.klen);
         m.k[m.klen] = '\0';
         /* parse ws colon ws */
-        w_parse_whitespace(c);
+        w_parse_space(c);
         if (*c->json != ':') {
             ret = W_PARSE_MISS_COLON;
             break;
         }
         c->json++;
-        w_parse_whitespace(c);
+        w_parse_space(c);
         /* parse value */
         if ((ret = w_parse_value(c, &m.v)) != W_PARSE_OK)
             break;
@@ -293,10 +308,10 @@ static int w_parse_object(w_context* c, w_value* v) {
         size++;
         m.k = NULL; /* ownership is transferred to member on stack */
         /* parse ws [comma | right-curly-brace] ws */
-        w_parse_whitespace(c);
+        w_parse_space(c);
         if (*c->json == ',') {
             c->json++;
-            w_parse_whitespace(c);
+            w_parse_space(c);
         }
         else if (*c->json == '}') {
             size_t s = sizeof(w_member) * size;
@@ -330,9 +345,9 @@ int w_parse(w_value* v, const char* json) {
     c.stack = NULL;
     c.size = c.top = 0;
     w_init(v);
-    w_parse_whitespace(&c);
+    w_parse_space(&c);
     if ((ret = w_parse_value(&c, v)) == W_PARSE_OK) {
-        w_parse_whitespace(&c);
+        w_parse_space(&c);
         if (*c.json != '\0') {
             v->type = W_NULL;
             ret = W_PARSE_ROOT_NOT_SINGULAR;
@@ -384,7 +399,7 @@ void w_set_boolean(w_value* v, int b) {
 
 double w_get_number(const w_value* v) {
     assert(v != NULL && v->type == W_NUMBER);
-    return v->n;
+    return v->u.n;
 }
 
 void w_set_number(w_value* v, double n) {

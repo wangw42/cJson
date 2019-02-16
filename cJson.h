@@ -18,7 +18,7 @@ struct w_value{
         double n;                           /* number */
     }u;
 	w_type type;
-}w_value;
+};
 
 struct w_member {
     char* k; size_t klen;   /* member key string, key string length */
